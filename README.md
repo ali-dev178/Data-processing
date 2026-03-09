@@ -20,7 +20,7 @@ Producer Sources (banking, ecommerce, payroll)
 ## Technology Stack
 
 - **Language:** PHP 8.3 — **Framework:** Laravel
-- **Queue:** Kafka (KRaft mode, no Zookeeper) — high throughput, partition-based parallelism, offset tracking
+- **Message Broker:** Kafka (KRaft mode, no Zookeeper) — high throughput, partition-based parallelism, offset tracking
 - **Database:** PostgreSQL — ACID transactions, `ON CONFLICT` upserts, aggregation with `GROUP BY`
 - **Queue backend:** Redis — job queue for async alert and notification dispatch (sub-millisecond push, non-blocking)
 - **Containerization:** Docker Compose — PHP-FPM, nginx, supervisord .etc
@@ -73,7 +73,7 @@ curl "http://localhost:8000/api/query?type=positive&start_time=2026-03-09 00:00:
 
 ## Scalability & Performance
 
-Target: 100,000 messages/hour. Benchmark on a single Docker host with 3 consumer processes: **~150 records/sec (~544K records/hour)** — processed 102K records in ~11 minutes, exceeding the requirement by 5x.
+Target: 100,000 messages/hour. Benchmark on a single Docker container with 3 consumer processes: **~150 records/sec (~544K records/hour)** — processed 102K records in ~11 minutes, exceeding the requirement by 5x.
 
 Aggregation query benchmarks over 132K records (internal HTTP round trip via nginx, including JSON serialization):
 
@@ -83,12 +83,13 @@ Aggregation query benchmarks over 132K records (internal HTTP round trip via ngi
 | Type filter | ~340ms |
 | Both filters (type + time range) | ~340ms |
 
+> **Note:** These benchmarks are from a dev environment with no caching or Laravel optimizations enabled. Production results will be faster.
+
 **Scaling further if needed:**
 - Increase Kafka partitions + consumer processes (linear throughput scaling)
-- Batch inserts instead of per-record inserts (trade latency for throughput)
+- Horizontal scaling of web and consumer tier
 - Read replicas for the query API (separate read/write load)
 - Table partitioning on `records.time` (keep query performance constant as data grows)
-- Horizontal scaling of web tier (`docker-compose up --scale app-web=N`)
 - Pagination on query API (`page` + `per_page`) for large result sets
 - Exponential `$backoff` on jobs (e.g. `[5, 30, 120]`) — currently fixed at 5s between retries, exponential backoff would reduce pressure on downstream services during sustained failures
 
@@ -120,19 +121,11 @@ All values stored as `DECIMAL(20,4)` in PostgreSQL, all arithmetic done with `bc
 `numprocs=3` in supervisord, one consumer per partition. Maximum parallelism without rebalancing overhead.
 
 ### Two separate queries for aggregation instead of JSON_AGG
-Summary query (`GROUP BY` with `COUNT`, `SUM`) computes totals in PostgreSQL. Records query fetches all matching rows. PHP groups records by `destination_id` and merges with summaries. Benchmarked on 102K records:
+Summary query (`GROUP BY` with `COUNT`, `SUM`) computes totals in PostgreSQL. Records query fetches all matching rows. PHP groups records by `destination_id` and merges with summaries.
 
-| Approach | Time | Memory overflow at 128MB |
-|----------|------|-------------|
-| Two separate queries (chosen) | ~87ms | No |
-| JSON_AGG single query | 421ms | Yes |
-| Eloquent get+groupBy | 8,887ms | Yes |
-
-**Why not JSON_AGG?** Builds massive JSON strings per group inside PostgreSQL, then PHP decodes them — double serialization, memory overflow on large groups.
-**Why not Eloquent?** Hydrates 100K+ model objects just to call `->sum()` and `->count()` in PHP — 100x slower than letting PostgreSQL do it.
-**Why not `destination_summaries` table?** No `type`/`time` columns — can't apply query filters. Different grouping (`destination_id + reference` vs `destination_id` only). Stores cumulative all-time totals, not filterable subsets.
-
-Eloquent is used throughout for CRUD (inserts, model casts, counts) but not for this aggregation — PostgreSQL handles `GROUP BY`/`SUM` natively and is the right tool for it.
+**Why not JSON_AGG?** Builds massive JSON strings per group inside PostgreSQL — memory overflow at 128MB on 100K+ records.
+**Why not Eloquent?** Hydrates 100K+ model objects in PHP — ~100x slower than letting PostgreSQL do the aggregation.
+**Why not `destination_summaries` table?** No `type`/`time` columns — can't apply query filters. Stores cumulative all-time totals, not filterable subsets.
 
 ### Composite indexes on `records` table
 Two indexes — `(destination_id, time)` and `(destination_id, type)` — cover all query filter combinations. PostgreSQL combines them via BitmapAnd when both filters are used.
